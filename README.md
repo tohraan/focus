@@ -39,6 +39,7 @@ Design rules we kept: every performance number is measured on the device, never 
 ## Demo
 
 - **Physical demo:** we show the vision engine live on an iPhone held at eye level, as close to the glasses experience as we can get it, next to the glasses concept.
+- **Pitch deck:** 14 slides as PNGs in [`docs/deck/`](docs/deck) (start at [01](docs/deck/01.png)).
 - **Videos:** _to be added here._
 - **Hosted link:** none. The test rig is a native iOS app and the glasses are a concept.
 
