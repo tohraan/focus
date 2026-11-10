@@ -1,0 +1,14 @@
+parameter,value_mm,tag,source_or_convention
+frame_width,146.1,LABEL->MEASURED,scale anchor 146 (sheet label); CAD bbox 146.1
+frame_height,45.2,MEASURED,uniform scale from width; label 44
+lens_opening_width,50.8,MEASURED,dark opening inside rim; label 52
+lens_opening_gap,19.3,MEASURED,min gap between openings; label 18 (convention unresolved)
+temple_length_from_hinge,144.4,DERIVED,side view scaled to label 150
+frame_depth_front,13.0,DERIVED,side view (14.0 incl lens lip)
+shield_width,126.4,PROVISIONAL,sheet 146; fitted to clear temples
+shield_height,53.4,MEASURED,front and side panels (label 44)
+shield_depth,33.2,DERIVED,side panel at front-view scale (label 38; plan implies 50)
+shield_wall,5.5,PROVISIONAL,visual thickness
+shield_foam,9.0,PROVISIONAL,
+magnet_mount_pad,7.3x9.3,MEASURED,E3/side panel pad size
+magnet_gap,0.3,PROVISIONAL,

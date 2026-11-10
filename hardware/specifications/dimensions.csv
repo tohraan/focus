@@ -1,0 +1,82 @@
+name,value,unit,source_or_derivation,status
+frame_w,146,mm,reference image label (AI-generated infographic; unverified),PROVISIONAL
+frame_h,44,mm,reference image label (AI-generated infographic; unverified),PROVISIONAL
+lens_w,52,mm,reference image label (AI-generated infographic; unverified); per-eye opening width,PROVISIONAL
+bridge_w,18,mm,reference image label (AI-generated infographic; unverified); gap between lens openings,PROVISIONAL
+temple_len,150,mm,"reference image label (AI-generated infographic; unverified); convention: hinge axis to tip, measured along Y",PROVISIONAL
+lens_h,32,mm,"assumption: wayfarer proportion, rim 5-7 mm",PROVISIONAL
+lens_corner_r,9,mm,assumption from reference contour,PROVISIONAL
+lens_dz,-1,mm,assumption: opening centre below frame centre (thicker top rim),PROVISIONAL
+corner_r,10,mm,assumption from reference contour,PROVISIONAL
+front_d,8,mm,assumption: front frame depth (rim),PROVISIONAL
+corner_block_w,14,mm,assumption: thickened outer corner width,PROVISIONAL
+corner_block_fwd,6,mm,assumption: corner block protrudes forward of front plane,PROVISIONAL
+corner_block_z0,-14,mm,assumption: corner block lower z,PROVISIONAL
+corner_block_z1,22,mm,assumption: corner block upper z (flush with top),PROVISIONAL
+front_edge_r,1.5,mm,assumption: front-edge fillet,PROVISIONAL
+nose_arch_hw,6,mm,assumption: nose arch half-width,PROVISIONAL
+nose_arch_h,11,mm,assumption: nose arch height,PROVISIONAL
+pane_t,1.6,mm,assumption: placeholder dark optical pane thickness (no optics defined),PROVISIONAL
+pane_recess,2.4,mm,assumption: pane front surface recessed from front plane,PROVISIONAL
+ledge,1.5,mm,assumption: pane seat ledge width,PROVISIONAL
+pane_clr,0.15,mm,assumption: pane-to-opening clearance (per side),PROVISIONAL
+temple_t,4,mm,assumption: temple thickness (x),PROVISIONAL
+temple_h,11,mm,assumption: temple width (z) at hinge,PROVISIONAL
+temple_h_tip,7.5,mm,assumption: temple width at tip,PROVISIONAL
+temple_z,4,mm,assumption: temple/hinge centre height,PROVISIONAL
+ear_R,80,mm,assumption: ear-curve radius (arc turns 30 deg so y-extent = 40),PROVISIONAL
+hinge_pin_d,1.4,mm,assumption,PROVISIONAL
+hinge_gap,0.25,mm,assumption: axial clearance,PROVISIONAL
+lug_t,3.5,mm,assumption: frame hinge lug thickness,PROVISIONAL
+hinge_len,4.5,mm,assumption: hinge axis offset behind rear face,PROVISIONAL
+ind_len,14,mm,assumption: status indicator window length (function undefined),PROVISIONAL
+ind_h,1.6,mm,assumption,PROVISIONAL
+ind_depth,0.6,mm,assumption,PROVISIONAL
+ind_y,6,mm,assumption: indicator start behind hinge axis,PROVISIONAL
+nose_pad_t,2.5,mm,assumption,PROVISIONAL
+cam_x,67,mm,assumption: outer-corner position from reference,PROVISIONAL
+cam_z,9,mm,assumption,PROVISIONAL
+cam_ap_d,6,mm,assumption: aperture only; not a module dimension,PROVISIONAL
+cam_ap_depth,3,mm,assumption: aperture recess depth,PROVISIONAL
+cam_env,,mm,no camera module selected,UNRESOLVED
+display_env,,mm,no display/optics selected; internal optical assembly not modelled,UNRESOLVED
+optical_clearance,,mm,needs optical design,UNRESOLVED
+sensor_env,,mm,no IMU/sensor selected,UNRESOLVED
+wiring_clearance,,mm,no cable path defined,UNRESOLVED
+sh_x,68,mm,assumption: shield outer half-width limit = temple inner face 69 - 1 clearance,PROVISIONAL
+sh_win_w,124,mm,"assumption: shield inner window width (clears both openings, 61+1)",PROVISIONAL
+sh_win_h,34,mm,assumption: shield inner window height,PROVISIONAL
+sh_win_r,10,mm,assumption,PROVISIONAL
+sh_notch_hw,14,mm,assumption: nose notch half-width,PROVISIONAL
+sh_notch_h,14,mm,assumption: nose notch height,PROVISIONAL
+pad_t,5,mm,assumption: soft facial interface thickness (along y),PROVISIONAL
+face_d0,12,mm,assumption: frame-rear to face distance at midline; NOT anthropometric data,PROVISIONAL
+face_R,110,mm,assumption: horizontal face wrap radius; NOT anthropometric data,PROVISIONAL
+sh_slot_hh,6.0,mm,derived: temple_h/2 + 0.5 clearance; hinge-sweep slot half-height in shield side walls,DERIVED
+sh_slot_y0,2.6,mm,assumption: slot starts this far behind the mating plane (keeps magnet-pocket strip intact),PROVISIONAL
+sh_clear,0.0,mm,"shield front face seated on frame rear face (contact, no gap)",PROVISIONAL
+attach_clr,0.2,mm,assumption: pin/pocket clearance,PROVISIONAL
+mag_a,4.5,mm,placeholder square envelope; no magnet selected,PROVISIONAL
+mag_t,1.5,mm,placeholder; no magnet selected,PROVISIONAL
+mag_pocket_depth,1.8,mm,derived: mag_t + 0.3 adhesive film,DERIVED
+mag_pocket_a,4.7,mm,derived: mag_a + 0.2,DERIVED
+mag_grade_force,,N,no magnet selected; retention force NOT determined,UNRESOLVED
+mag_corner_x,65,mm,assumption: corner magnet x (+/-),PROVISIONAL
+mag_corner_z,4,mm,assumption: corner magnet z,PROVISIONAL
+mag_top_x,28,mm,assumption: top magnet x (+/-),PROVISIONAL
+mag_top_z,19,mm,assumption: top magnet z,PROVISIONAL
+pin_d,2.2,mm,assumption: locating pin,PROVISIONAL
+pin_h,2.5,mm,assumption,PROVISIONAL
+pin1_x,-46,mm,assumption: asymmetric (poka-yoke),PROVISIONAL
+pin1_z,19,mm,assumption,PROVISIONAL
+pin2_x,50,mm,assumption,PROVISIONAL
+pin2_z,-20,mm,assumption,PROVISIONAL
+install_travel,60,mm,exploded-view travel along +Y,PROVISIONAL
+lens_cx,35.0,mm,"bridge_w/2 + lens_w/2 (lens-centre x, symmetric)",DERIVED
+rim_outer,12.0,mm,frame_w/2 - (lens_cx + lens_w/2); must be > 0 for compatibility,DERIVED
+rim_top,7.0,mm,frame_h/2 - (lens_dz + lens_h/2),DERIVED
+rim_bottom,5.0,mm,frame_h/2 + lens_dz - lens_h/2,DERIVED
+hinge_x,71.0,mm,frame_w/2 - temple_t/2,DERIVED
+hinge_y,12.5,mm,front_d + hinge_len,DERIVED
+sh_w,136,mm,2*sh_x,DERIVED
+temple_straight,108.125,mm,temple_len - ear_R*sin(30deg) - (temple_h_tip/2)*sin(30deg): makes rear-most tip point exactly temple_len behind the hinge axis,DERIVED
