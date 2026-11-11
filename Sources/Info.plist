@@ -23,7 +23,7 @@
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
 	<key>NSCameraUsageDescription</key>
-	<string>FOCUS processes the live camera feed on-device to hide people from the displayed view. Nothing is recorded or uploaded.</string>
+	<string>FOCUS processes the live camera feed on-device to hide people, try on the glasses and isolate you in another world. Nothing is recorded or uploaded.</string>
 	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>UILaunchScreen</key>

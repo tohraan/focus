@@ -3,6 +3,7 @@ options:
   bundleIdPrefix: com.tohraan
   deploymentTarget:
     iOS: "17.0"
+    macOS: "14.0"
 settings:
   base:
     SWIFT_VERSION: "5.0"
@@ -20,9 +21,39 @@ targets:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: FOCUS
-        NSCameraUsageDescription: "FOCUS processes the live camera feed on-device to hide people from the displayed view. Nothing is recorded or uploaded."
+        NSCameraUsageDescription: "FOCUS processes the live camera feed on-device to hide people, try on the glasses and isolate you in another world. Nothing is recorded or uploaded."
         UILaunchScreen: {}
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         UIRequiredDeviceCapabilities: [arkit]
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
+  FocusBench:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+        excludes: [ContentView.swift, FocusApp.swift, Info.plist, UI, "TryOn/Resources"]
+      - path: Bench
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tohraan.focus-bench
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+        DEVELOPMENT_TEAM: ""
+        ENABLE_HARDENED_RUNTIME: NO
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_LSUIElement: YES
+  FocusTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+        excludes: [render_check.swift]
+    dependencies:
+      - target: Focus
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tohraan.focus-tests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Focus.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Focus"
+        BUNDLE_LOADER: "$(TEST_HOST)"

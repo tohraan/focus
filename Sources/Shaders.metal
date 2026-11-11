@@ -147,13 +147,14 @@ static float3 fillColor(texture2d<float> fill, float2 uv) {
 // ================= Still-camera background plate =================
 // Camera does not move: keep a per-pixel clean background (plate) learned from pixels that are outside every person
 // mask AND stable over time. Foreground = person masks, plus anything that differs from the plate next to a person
-// (arms/legs the matte missed, shadows). Works at 1/3 resolution in image space (no pose needed).
+// (arms/legs the matte missed, shadows). Works on the world-anchored equirectangular canvas.
 constant float3 LW = float3(0.299, 0.587, 0.114);
 
 struct StillU {
     float4 gain;            // live/plate brightness ratio per channel (smoothed on CPU)
     float2 imageSize;       // full-res camera image
     float learn;            // 0 while the table is shaking: use the plate, do not update it
+    float ringScale;        // 3 / (camera px per canvas px): keeps search distances constant in image terms
 };
 
 static float3 liveAt(texture2d<float> Y, texture2d<float> C, float2 uv, float2 px) {
@@ -164,6 +165,34 @@ static float3 liveAt(texture2d<float> Y, texture2d<float> C, float2 uv, float2 p
 
 static float max3(float3 v) { return max(v.x, max(v.y, v.z)); }
 
+// World-anchored canvas: an equirectangular map of every direction (gravity-aligned, world-fixed).
+// The plate lives in canvas pixels, so it keeps its meaning while the camera rotates (handheld). Rotation only, no translation.
+struct CanvasU {
+    float3x3 Rt;            // current camera -> world
+    float3x3 Rref;          // canvas camera -> world
+    float fx, fy, cx, cy;   // image intrinsics (image px)
+    float2 imageSize;       // camera image px
+    float2 canvasSize;      // canvas px
+    float4 cf;              // canvas intrinsics: fx, fy, cx, cy (canvas px)
+};
+
+// The canvas is an equirectangular map of all directions around the phone (world-fixed, gravity aligned, rotation only).
+static float2 canvasToImageUV(float2 cpx, constant CanvasU& m, thread bool& ok) {
+    float3 d = panoToDir(cpx / m.canvasSize);
+    float3 dc = transpose(m.Rt) * d;
+    ok = dc.z < -0.05;
+    float px = m.fx * (dc.x / -dc.z) + m.cx;
+    float py = m.cy - m.fy * (dc.y / -dc.z);
+    return float2(px, py) / m.imageSize;
+}
+
+static float2 imageUVToCanvasUV(float2 iuv, constant CanvasU& m, thread bool& ok) {
+    float2 p = iuv * m.imageSize;
+    float3 dc = normalize(float3((p.x - m.cx) / m.fx, -(p.y - m.cy) / m.fy, -1.0));
+    ok = true;
+    return dirToPano(m.Rt * dc);
+}
+
 // flags (r8Uint): 1 person (shown), 2 person (blocks learning), 4 big difference from plate, 8 shadow-like, 16 moving
 kernel void stillClassify(texture2d<float> Y [[texture(0)]],
                           texture2d<float> C [[texture(1)]],
@@ -173,11 +202,14 @@ kernel void stillClassify(texture2d<float> Y [[texture(0)]],
                           texture2d<float> lastT [[texture(5)]],
                           texture2d<uint, access::write> cls [[texture(6)]],
                           constant StillU& u [[buffer(0)]],
+                          constant CanvasU& m [[buffer(2)]],
                           uint2 gid [[thread_position_in_grid]]) {
     uint W = plate.get_width(), H = plate.get_height();
     if (gid.x >= W || gid.y >= H) return;
-    float2 px = 1.0 / float2(W, H);
-    float2 uv = (float2(gid) + 0.5) * px;
+    bool ok;
+    float2 uv = canvasToImageUV(float2(gid) + 0.5, m, ok);
+    if (!ok || uv.x < 0.004 || uv.x > 0.996 || uv.y < 0.004 || uv.y > 0.996) { cls.write(uint4(32, 0, 0, 0), gid); return; }   // canvas pixel outside the current view
+    float2 px = (3.0 / u.ringScale) / u.imageSize;                  // one canvas texel in image uv
     float3 live = liveAt(Y, C, uv, px);
 
     float show = 0, learn = 0;
@@ -187,7 +219,7 @@ kernel void stillClassify(texture2d<float> Y [[texture(0)]],
     if (yolo.sample(linClamp, uv).r > 0.4) show = 1;
     for (int dy = -2; dy <= 2; dy++)
         for (int dx = -2; dx <= 2; dx++)
-            if (mask.sample(linClamp, uv + float2(dx, dy) * 7.0 / u.imageSize).r > 0.1) learn = 1;
+            if (mask.sample(linClamp, uv + float2(dx, dy) * 9.0 / u.imageSize).r > 0.1) learn = 1;
     if (yoloVeto(yolo, uv) > 0.3) learn = 1;
     learn = max(learn, show);
 
@@ -211,10 +243,12 @@ kernel void stillResolve(texture2d<uint> cls [[texture(0)]],
                          texture2d<float> lastT [[texture(1)]],
                          texture2d<float> fgPrev [[texture(2)]],
                          texture2d<float, access::write> fgRaw [[texture(3)]],
+                         constant StillU& u [[buffer(0)]],
                          uint2 gid [[thread_position_in_grid]]) {
     int W = int(cls.get_width()), H = int(cls.get_height());
     if (int(gid.x) >= W || int(gid.y) >= H) return;
     uint own = cls.read(gid).r;
+    if (own & 32u) { fgRaw.write(0.0, gid); return; }                  // outside the current view
     bool show = own & 1u, big = own & 4u, shadow = own & 8u, moving = own & 16u;
     float run = lastT.read(gid).a;
     bool fg = show;
@@ -222,9 +256,10 @@ kernel void stillResolve(texture2d<uint> cls [[texture(0)]],
         // distance (plate px) to the nearest shown person pixel, searched on rings; previous foreground also counts for 'big'
         float nearD = 99;
         for (int r = 4; r <= 20; r += 4) {
+            float rr = float(r) * u.ringScale;                       // ring radius in plate px, constant in image terms
             for (int i = 0; i < 8; i++) {
                 float a = float(i) * 0.785398;
-                int2 q = clamp(int2(gid) + int2(round(cos(a) * float(r)), round(sin(a) * float(r))), int2(0), int2(W - 1, H - 1));
+                int2 q = clamp(int2(gid) + int2(round(cos(a) * rr), round(sin(a) * rr)), int2(0), int2(W - 1, H - 1));
                 if (cls.read(uint2(q)).r & 1u) { nearD = min(nearD, float(r)); }
             }
             if (nearD < 99) break;
@@ -232,12 +267,13 @@ kernel void stillResolve(texture2d<uint> cls [[texture(0)]],
         bool nearPrev = false;
         for (int i = 0; i < 8; i++) {
             float a = float(i) * 0.785398;
-            int2 q = clamp(int2(gid) + int2(round(cos(a) * 3.0), round(sin(a) * 3.0)), int2(0), int2(W - 1, H - 1));
+            int2 q = clamp(int2(gid) + int2(round(cos(a) * 3.0 * u.ringScale), round(sin(a) * 3.0 * u.ringScale)), int2(0), int2(W - 1, H - 1));
             if (fgPrev.read(uint2(q)).r > 0.5) nearPrev = true;
         }
-        if (big && run < 90 && (nearD <= 12 || nearPrev)) fg = true;      // matte missed part of the body
-        else if (big && moving) fg = true;                                // moving thing the matte missed entirely
-        else if (shadow && nearD <= 20) fg = true;                        // shadow next to a person
+        bool steady = u.learn > 0.5;                                      // camera quiet and plate aligned: only then trust differences from the plate
+        if (big && run < 90 && (nearD <= 12 || (steady && nearPrev))) fg = true;      // matte missed part of the body
+        else if (steady && big && moving) fg = true;                      // moving thing the matte missed entirely
+        else if (steady && shadow && (nearD <= 20 || nearPrev)) fg = true;            // shadow next to a person (grows to the full shadow)
     }
     fgRaw.write(fg ? 1.0 : 0.0, gid);
 }
@@ -253,15 +289,19 @@ kernel void stillCommit(texture2d<float> Y [[texture(0)]],
                         texture2d<float, access::write> off [[texture(8)]],
                         constant StillU& u [[buffer(0)]],
                         device atomic_uint* stats [[buffer(1)]],
+                        constant CanvasU& m [[buffer(2)]],
                         uint2 gid [[thread_position_in_grid]],
                         uint lane [[thread_index_in_simdgroup]]) {
     int W = int(plate.get_width()), H = int(plate.get_height());
     bool inside = int(gid.x) < W && int(gid.y) < H;
-    float3 statLive = 0, statPlate = 0; float statN = 0, statK = 0;
+    float3 statLive = 0, statPlate = 0; float statN = 0, statK = 0, statB = 0, statV = 0, statI = 0;
+    if (inside && (cls.read(gid).r & 32u)) { fgOut.write(0.0, gid); inside = false; }          // outside the view: no state change
     if (inside) {
-        float2 px = 1.0 / float2(W, H);
-        float2 uv = (float2(gid) + 0.5) * px;
+        bool vok;
+        float2 uv = canvasToImageUV(float2(gid) + 0.5, m, vok);
+        float2 px = (3.0 / u.ringScale) / u.imageSize;
         float3 live = liveAt(Y, C, uv, px);
+        statI = 1;
         float cnt = 0;
         for (int dy = -2; dy <= 2; dy++)
             for (int dx = -2; dx <= 2; dx++) {
@@ -279,11 +319,12 @@ kernel void stillCommit(texture2d<float> Y [[texture(0)]],
         float4 pl = plate.read(gid);
         if (!learnBlock && u.learn > 0.5) {
             if (pl.a < 0.01 || fabs(pl.a - 0.51) < 0.01) {                       // never seen, or only generated (MI-GAN): real data replaces it
-                if (run >= 8) pl = float4(saturate(live / g), 0.3);                 // first sight of this background pixel
+                if (run >= 10) pl = float4(live, 0.3);                 // first sight of this background pixel
             } else if (run >= 4) {
                 bool absorb = (own & 4u) && run >= 90;                             // scene really changed (moved chair)
-                float rate = absorb ? 0.25 : 0.03;
-                pl.rgb += rate * (saturate(live / g) - pl.rgb);
+                float nObs = max(0.0, round((pl.a - 0.3) / 0.08));                  // observations so far (confidence grows 0.08 per observation)
+                float rate = absorb ? 0.25 : (pl.a >= 1.0 ? 0.03 : max(0.03, 1.0 / (nObs + 2.0)));   // running mean at first, slow drift afterwards
+                pl.rgb += rate * (live - pl.rgb);                       // plate holds raw camera values; the gain is applied only when comparing / showing, so it cannot feed back
                 pl.a = min(1.0, pl.a + 0.08);
             }
             plate.write(pl, gid);
@@ -294,10 +335,13 @@ kernel void stillCommit(texture2d<float> Y [[texture(0)]],
         bool valid = pl.a > 0.5 && !fgAny && !(own & 2u) && !(own & 16u);
         off.write(valid ? float4(clamp(live - pd, -0.12, 0.12), 1.0) : float4(0.0), gid);
         if (pl.a > 0.5) statK = 1;
+        if (pl.a > 0.5 && !fgAny && !(own & 2u)) { statV = 1; if (own & 4u) statB = 1; }      // visible background: how much of it differs strongly from the plate
         if (valid && run >= 4) { statLive = live; statPlate = pl.rgb; statN = 1; }
     }
     // exposure statistics: one atomic per SIMD group
-    float3 sl = simd_sum(statLive), sp = simd_sum(statPlate); float sn = simd_sum(statN), sk = simd_sum(statK);
+    float3 sl = simd_sum(statLive), sp = simd_sum(statPlate); float sn = simd_sum(statN), sk = simd_sum(statK), sb = simd_sum(statB), sv = simd_sum(statV), si = simd_sum(statI);
+    if (lane == 0 && si > 0) atomic_fetch_add_explicit(&stats[10], uint(si), memory_order_relaxed);
+    if (lane == 0 && sv > 0) { atomic_fetch_add_explicit(&stats[9], uint(sv), memory_order_relaxed); atomic_fetch_add_explicit(&stats[8], uint(sb), memory_order_relaxed); }
     if (lane == 0 && sk > 0) atomic_fetch_add_explicit(&stats[7], uint(sk), memory_order_relaxed);
     if (lane == 0 && sn > 0) {
         atomic_fetch_add_explicit(&stats[0], uint(sl.x * 256.0), memory_order_relaxed);
@@ -308,6 +352,31 @@ kernel void stillCommit(texture2d<float> Y [[texture(0)]],
         atomic_fetch_add_explicit(&stats[5], uint(sp.z * 256.0), memory_order_relaxed);
         atomic_fetch_add_explicit(&stats[6], uint(sn), memory_order_relaxed);
     }
+}
+
+
+// Diagnostics: coarse (1024x512) dumps of the whole canvas: live frame (where in view), plate colour, plate confidence, foreground.
+kernel void stillDump(texture2d<float> Y [[texture(0)]],
+                      texture2d<float> C [[texture(1)]],
+                      texture2d<float> disp [[texture(2)]],
+                      texture2d<float> fg [[texture(3)]],
+                      texture2d<float, access::write> o0 [[texture(4)]],
+                      texture2d<float, access::write> o1 [[texture(5)]],
+                      texture2d<float, access::write> o2 [[texture(6)]],
+                      texture2d<float, access::write> o3 [[texture(7)]],
+                      constant CanvasU& m [[buffer(0)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    uint W = o0.get_width(), H = o0.get_height();
+    if (gid.x >= W || gid.y >= H) return;
+    float2 cuv = (float2(gid) + 0.5) / float2(W, H);
+    bool ok;
+    float2 uv = canvasToImageUV(cuv * m.canvasSize, m, ok);
+    bool inView = ok && uv.x > 0.0 && uv.x < 1.0 && uv.y > 0.0 && uv.y < 1.0;
+    o0.write(float4(inView ? ycbcr(Y, C, uv) : float3(0), 1.0), gid);
+    float4 d = disp.sample(linPano, cuv);
+    o1.write(float4(d.rgb, 1.0), gid);
+    o2.write(float4(float3(d.a), 1.0), gid);
+    o3.write(float4(float3(fg.sample(linPano, cuv).r), 1.0), gid);
 }
 
 kernel void stillClear(texture2d<float, access::write> a [[texture(0)]],
@@ -331,13 +400,16 @@ kernel void miganPrep(texture2d<float> Y [[texture(0)]],
                       device float* imgBuf [[buffer(0)]],
                       device float* maskBuf [[buffer(1)]],
                       device atomic_uint* count [[buffer(2)]],
+                      constant CanvasU& m [[buffer(3)]],
                       uint2 gid [[thread_position_in_grid]]) {
     const uint N = 512;
     if (gid.x >= N || gid.y >= N) return;
     float2 uv = (float2(gid) + 0.5) / float(N);
     float3 live = ycbcr(Y, C, uv);
-    float f = fg.sample(linClamp, uv).r;
-    float4 p = disp.sample(linClamp, uv);
+    bool cok;
+    float2 cuv = imageUVToCanvasUV(uv, m, cok);
+    float f = cok ? fg.sample(linClamp, cuv).r : 0.0;
+    float4 p = cok ? disp.sample(linClamp, cuv) : float4(0.0);
     bool inPerson = f > 0.08;
     bool hole = inPerson && p.a < 0.5;
     float3 col = (inPerson && !hole) ? p.rgb : live;
@@ -353,17 +425,20 @@ kernel void miganCommit(texture2d<float> holeTex [[texture(0)]],
                         texture2d<float> gen [[texture(1)]],
                         texture2d<float, access::read_write> plate [[texture(2)]],
                         constant float4& gain [[buffer(0)]],
+                        constant CanvasU& m [[buffer(1)]],
                         uint2 gid [[thread_position_in_grid]]) {
     uint W = plate.get_width(), H = plate.get_height();
     if (gid.x >= W || gid.y >= H) return;
-    float2 uv = (float2(gid) + 0.5) / float2(W, H);
+    bool ok;
+    float2 uv = canvasToImageUV(float2(gid) + 0.5, m, ok);          // mapping as it was when the request was made
+    if (!ok || uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return;
     constexpr sampler nearest(filter::nearest, address::clamp_to_edge);
     if (holeTex.sample(nearest, uv).r < 0.5) return;
     float4 pl = plate.read(gid);
     if (pl.a >= 0.5) return;
     float3 g = clamp(gain.rgb, 0.6, 1.6);
     float3 c = gen.sample(linClamp, uv).rgb;
-    plate.write(float4(saturate(c / g), 0.51), gid);
+    plate.write(float4(saturate(c), 0.51), gid);
 }
 
 // Offset diffusion: low-frequency (live - plate) measured on visible background, spread into the hole so no seam shows.
@@ -377,8 +452,9 @@ static float3 stillOffset(texture2d<float> off, float2 uv) {
 }
 
 // Replacement colour for a masked pixel when the still plate is valid; falls back to `engineRepl` where the plate has not seen the pixel.
-static float3 stillReplacement(texture2d<float> disp, texture2d<float> off, float2 uv, float3 engineRepl) {
-    float4 p = disp.sample(linClamp, uv);
+static float3 stillReplacement(texture2d<float> disp, texture2d<float> off, float2 uv, bool ok, float3 engineRepl) {
+    if (!ok) return engineRepl;
+    float4 p = disp.sample(linPano, uv);
     float k = smoothstep(0.35, 0.5, p.a);
     float3 plateCol = saturate(p.rgb + stillOffset(off, uv));
     return mix(engineRepl, plateCol, k);
@@ -394,7 +470,8 @@ fragment float4 compositeFS(VOut in [[stage_in]],
                             texture2d<float> stDisp [[texture(8)]],
                             texture2d<float> stOff [[texture(9)]],
                             texture2d<float> stFg [[texture(10)]],
-                            constant RenderUniforms& u [[buffer(0)]]) {
+                            constant RenderUniforms& u [[buffer(0)]],
+                            constant CanvasU& cm [[buffer(2)]]) {
     float2 iuv = (u.viewToImage * float3(in.uv, 1.0)).xy;
     float3 live = ycbcr(Y, C, iuv);
     float m = mask.sample(linClamp, iuv).r;
@@ -404,7 +481,8 @@ fragment float4 compositeFS(VOut in [[stage_in]],
             m = max(m, mask.sample(linClamp, iuv + float2(dx, dy) * t * 2.0).r);
     m = max(m, yolo.sample(linClamp, iuv).r);          // only people Vision missed, no dilation
     m = smoothstep(0.25, 0.6, m);
-    if (u.still != 0) m = max(m, stFg.sample(linClamp, iuv).r);
+    bool cok = false; float2 cuv = float2(0);
+    if (u.still != 0) { cuv = imageUVToCanvasUV(iuv, cm, cok); if (cok) m = max(m, stFg.sample(linClamp, cuv).r); }
 
     float3 processed = live;
     if (m > 0.0) {
@@ -412,7 +490,7 @@ fragment float4 compositeFS(VOut in [[stage_in]],
         float3 dc = normalize(float3((p.x - u.cx) / u.fx, -(p.y - u.cy) / u.fy, -1.0));
         float4 mem = pano.sample(linPano, dirToPano(u.camToWorld * dc));
         float3 repl = mem.a > 0.5 ? saturate(mem.rgb * u.gain.rgb) : fillColor(fill, iuv);
-        if (u.still != 0) repl = stillReplacement(stDisp, stOff, iuv, repl);
+        if (u.still != 0) repl = stillReplacement(stDisp, stOff, cuv, cok, repl);
         processed = mix(live, repl, m);
     }
 
@@ -425,8 +503,38 @@ fragment float4 compositeFS(VOut in [[stage_in]],
     return float4(outc, 1.0);
 }
 
-// ---- AutoFill (LaMa) support ----
-// Builds the 512x512 LaMa inputs: image (CHW float, remembered colour under people where known) and hole mask
+
+// ---- Temporal mask stabiliser: instant attack, slow release (rates are per-step blend factors computed on the CPU) ----
+kernel void maskStabilize(texture2d<float> rawMask [[texture(0)]],
+                          texture2d<float> rawYolo [[texture(1)]],
+                          texture2d<float> prevMask [[texture(2)]],
+                          texture2d<float> prevYolo [[texture(3)]],
+                          texture2d<float, access::write> outMask [[texture(4)]],
+                          texture2d<float, access::write> outYolo [[texture(5)]],
+                          constant float4& rates [[buffer(0)]],        // x = attack, y = release (matte), z = release (YOLO channels)
+                          uint2 gid [[thread_position_in_grid]]) {
+    uint W = outMask.get_width(), H = outMask.get_height();
+    if (gid.x >= W || gid.y >= H) return;
+    float2 uv = (float2(gid) + 0.5) / float2(W, H);
+    float m = rawMask.sample(linClamp, uv).r;
+    float2 y = rawYolo.sample(linClamp, uv).rg;
+    float sm = prevMask.read(gid).r;
+    float2 sy = prevYolo.read(gid).rg;
+    sm = mix(sm, m, m > sm ? rates.x : rates.y);
+    sy = float2(mix(sy.x, y.x, y.x > sy.x ? rates.x : rates.z), mix(sy.y, y.y, y.y > sy.y ? rates.x : rates.z));
+    outMask.write(float4(sm, 0, 0, 1), gid);
+    outYolo.write(float4(sy, 0, 1), gid);
+}
+
+kernel void stabClear(texture2d<float, access::write> a [[texture(0)]],
+                      texture2d<float, access::write> b [[texture(1)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x < a.get_width() && gid.y < a.get_height()) a.write(float4(0), gid);
+    if (gid.x < b.get_width() && gid.y < b.get_height()) b.write(float4(0), gid);
+}
+
+// ---- AutoFill (MI-GAN) support ----
+// Builds the 512x512 MI-GAN inputs: image (CHW float, remembered colour under people where known) and hole mask
 // (person region whose background was never observed).
 kernel void prepLama(texture2d<float> Y [[texture(0)]],
                      texture2d<float> C [[texture(1)]],
@@ -498,7 +606,7 @@ kernel void prepMigan(texture2d<float> Y [[texture(0)]],
     if (hole) atomic_fetch_add_explicit(count, 1u, memory_order_relaxed);
 }
 
-// Writes the LaMa result into still-unknown memory at the pose the request was made from. alpha 0.6 = generated.
+// Writes the MI-GAN result into still-unknown memory at the pose the request was made from. alpha 0.6 = generated.
 kernel void writeGenerated(texture2d<float, access::read_write> pano [[texture(0)]],
                            texture2d<float> hole [[texture(1)]],
                            texture2d<float> gen [[texture(2)]],
@@ -655,7 +763,8 @@ fragment float4 compositeKF(VOut in [[stage_in]],
                             texture2d<float> stFg [[texture(10)]],
                             texture2d<float> genPano [[texture(11)]],
                             constant RenderUniforms& u [[buffer(0)]],
-                            constant KFUniforms& k [[buffer(1)]]) {
+                            constant KFUniforms& k [[buffer(1)]],
+                            constant CanvasU& cm [[buffer(2)]]) {
     float2 iuv = (u.viewToImage * float3(in.uv, 1.0)).xy;
     float3 live = ycbcr(Y, C, iuv);
     float m = mask.sample(linClamp, iuv).r;
@@ -665,7 +774,8 @@ fragment float4 compositeKF(VOut in [[stage_in]],
             m = max(m, mask.sample(linClamp, iuv + float2(dx, dy) * t * 2.0).r);
     m = max(m, yolo.sample(linClamp, iuv).r);
     m = smoothstep(0.25, 0.6, m);
-    if (u.still != 0) m = max(m, stFg.sample(linClamp, iuv).r);
+    bool cok = false; float2 cuv = float2(0);
+    if (u.still != 0) { cuv = imageUVToCanvasUV(iuv, cm, cok); if (cok) m = max(m, stFg.sample(linClamp, cuv).r); }
 
     float3 processed = live;
     if (m > 0.0) {
@@ -681,7 +791,7 @@ fragment float4 compositeKF(VOut in [[stage_in]],
             Cand c = kfCandidate(k, kfColor, kfMask, iuv * KFSIZE);
             if (c.valid > 0.5) repl = saturate(c.col + diffusedOffset(diff, iuv));
         }
-        if (u.still != 0) repl = stillReplacement(stDisp, stOff, iuv, repl);
+        if (u.still != 0) repl = stillReplacement(stDisp, stOff, cuv, cok, repl);
         processed = mix(live, repl, m);
     }
     float3 outc;
@@ -691,4 +801,21 @@ fragment float4 compositeKF(VOut in [[stage_in]],
     else outc = processed;
     if (u.mode == 2 && fabs(in.uv.x - u.splitX) < 0.002) outc = float3(1);
     return float4(outc, 1.0);
+}
+
+
+// Diagnostics: raw camera frame and the RAW person masks (before smoothing) at 640x480, for tuning detection on real footage.
+kernel void rawDump(texture2d<float> Y [[texture(0)]],
+                    texture2d<float> C [[texture(1)]],
+                    texture2d<float> mask [[texture(2)]],
+                    texture2d<float> yolo [[texture(3)]],
+                    texture2d<float, access::write> o0 [[texture(4)]],
+                    texture2d<float, access::write> o1 [[texture(5)]],
+                    uint2 gid [[thread_position_in_grid]]) {
+    uint W = o0.get_width(), H = o0.get_height();
+    if (gid.x >= W || gid.y >= H) return;
+    float2 uv = (float2(gid) + 0.5) / float2(W, H);
+    o0.write(float4(ycbcr(Y, C, uv), 1.0), gid);
+    float2 y = yolo.sample(linClamp, uv).rg;
+    o1.write(float4(mask.sample(linClamp, uv).r, y.x, y.y, 1.0), gid);   // r = Vision matte, g = YOLO extras, b = YOLO all detections
 }

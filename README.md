@@ -1,94 +1,159 @@
+<div align="center">
+
 # FOCUS
 
-**Smart spectacles that take the crowd out of your view.** FOCUS is a wearable: glasses that see the room, remove the people in it in real time and show you the space behind them, so you can concentrate on the board, the page or the task.
+### Headphones quiet the noise. **FOCUS quiets the room.**
 
-GDG Ideathon · Ideaverse · BITS Pilani, Dubai Campus
+Smart study glasses that edit people out of your view, so a shared library can feel like a room of your own.
 
-> **What is in this repo.** The product is the spectacles. The hardware is a concept (frame, shield and camera placement in parametric CAD). The **iPhone app is our proof-of-concept test rig**: it runs the same vision engine on a phone so we can build and measure it before the glasses hardware exists.
+[![Platform](https://img.shields.io/badge/iOS-17%2B-black?logo=apple&logoColor=white)](#run-the-app)
+[![Swift](https://img.shields.io/badge/Swift-5-F05138?logo=swift&logoColor=white)](Sources)
+[![Metal](https://img.shields.io/badge/Metal-GPU%20compositor-2447ff)](Sources/Shaders.metal)
+[![On-device](https://img.shields.io/badge/AI-100%25%20on--device-12b886)](#privacy)
+[![Status](https://img.shields.io/badge/status-early%20prototype-ff5b1f)](#honest-status)
 
-![Swift](https://img.shields.io/badge/Swift-6.3-F05138?logo=swift&logoColor=fff)
-![Metal](https://img.shields.io/badge/Metal-GPU-8E8E93?logo=apple&logoColor=fff)
-![ARKit](https://img.shields.io/badge/ARKit-pose-0A84FF)
-![Core ML](https://img.shields.io/badge/Core%20ML-on--device-34C759)
-![iOS](https://img.shields.io/badge/iOS-26-000?logo=apple)
-![Privacy](https://img.shields.io/badge/data%20stored-none-F2B84B)
+<a href="docs/media/focus-launch.mp4">
+  <img src="docs/media/hero.gif" alt="FOCUS launch film: noise, people, a magnetic-shield pair of glasses" width="760">
+</a>
 
-**Jump to:** [Why](#why-it-matters) · [How it works](#how-it-works) · [Demo](#demo) · [Hardware concept](#hardware-concept-glasses) · [Status](#prototype-status-measured-not-claimed) · [Run it](#run-it) · [Limits](#honest-limits)
+**[Watch the 38 s launch film](docs/media/focus-launch.mp4)** &nbsp;·&nbsp; **[Watch the Bob story](docs/media/focus-bob-story.mp4)** &nbsp;·&nbsp; **[Live pitch deck](https://focus-presenter.vercel.app/deck.html)**
 
-![Pipeline](docs/img/pipeline.png)
+</div>
 
-## Why it matters
+---
 
+## The problem
 
-Crowded lecture halls, libraries and labs are visually busy. For students prone to sensory overload, ADHD or social anxiety, constant movement and faces make it hard to hold attention on the task. Today the only options are to leave or to put up with it. FOCUS gives a third option: dim the crowd, keep the room.
+Headphones mute **noise**. Nothing mutes **people**: the laugh two tables over, the study group at the whiteboard, someone walking past again and again. In a library, the distraction is often what you *see*.
 
-> This filters the *screen*, not vision. A removed person is still physically there, so the app shows a persistent "Do not walk while using" notice.
+Be in the room, in your own space. Headphones do it for ears. **FOCUS does it for eyes.**
+
+## What it does
+
+| | |
+|---|---|
+| **Focus Mode** | Finds every person in the camera feed and replaces them with the room that was behind them. |
+| **Isolate** | Keeps your hands, desk, notebook and laptop real, and turns everything past the table into a calm world (moon, mountains, waterfall, forest). |
+| **Try-On** | Puts the FOCUS glasses on your face in AR, so you can see the frame before it exists. |
+
+The hardware idea: **two front cameras**, **two near-eye displays** showing a live, cleaned feed (not a window), and a **magnetic shield** that seals the room out. Magnets, hinge pins and soft nose pads make it something you can wear.
+
+## See it running
+
+Real recordings from an iPhone. No mock-ups.
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <a href="docs/media/demo-focus.mp4"><img src="docs/media/demo-focus.gif" alt="Focus Mode in split view" width="240"></a><br>
+      <b>Focus Mode</b><br>
+      Raw camera on the left, processed on the right, with live FPS, segmentation and latency on screen.
+    </td>
+    <td align="center" width="50%">
+      <a href="docs/media/demo-isolate.mp4"><img src="docs/media/demo-isolate.gif" alt="Isolate mode scanning a desk" width="240"></a><br>
+      <b>Isolate</b><br>
+      Scan the desk surface (or tap its corners) and everything past the table becomes a calm scene.
+    </td>
+  </tr>
+</table>
+
+*Click a GIF for the full video.*
+
+## The story: same seat, two ways to study
+
+Bob, a college library, 9 a.m. On the left he wears headphones. On the right he wears FOCUS. Same room, same hour.
+
+<a href="docs/media/focus-bob-story.mp4"><img src="docs/media/bob.gif" alt="Split-screen story: Bob without FOCUS vs with FOCUS" width="760"></a>
 
 ## How it works
 
-| Step | What happens | Tech |
-| --- | --- | --- |
-| 1. See | Camera frame, camera pose and intrinsics every frame | ARKit |
-| 2. Find people | Person mask, plus extra detections for small or distant people | Vision, YOLO11 segmentation (Core ML) |
-| 3. Remember the room | A still-camera background plate when the phone is steady; pose-aware keyframes with plane-induced homography when it moves | Metal compute kernels |
-| 4. Fill | Real remembered pixels first. Areas never seen are generated once and flagged as generated | MI-GAN 512 (Core ML, CPU+GPU) |
-| 5. Show | Feathered composite, with an original / processed toggle | Metal fragment shader |
+Four steps, run on every frame:
 
-Design rules we kept: every performance number is measured on the device, never assumed; generated pixels are never presented as real; nothing is recorded, uploaded or identified.
+1. **Spot** every person (Apple Vision person segmentation plus a YOLO11-seg model, with a mask stabiliser to stop edge flicker).
+2. **Remember** the wall behind them. The glasses keep a world-anchored memory of the room as people move through it. Only person-free pixels are ever written to memory.
+3. **Paint** that memory over the people.
+4. **Fill** whatever was never seen, with an on-device inpainting model (MI-GAN).
 
-## Demo
+<img src="docs/media/how-it-works.gif" alt="Animated four-step pipeline: spot, remember, paint, fill" width="720">
 
-- **Physical demo:** we show the vision engine live on an iPhone held at eye level, as close to the glasses experience as we can get it, next to the glasses concept.
-- **Pitch deck:** 14 slides as PNGs in [`docs/deck/`](docs/deck) (start at [01](docs/deck/01.png)).
-- **Videos:** _to be added here._
-- **Hosted link:** none. The test rig is a native iOS app and the glasses are a concept.
+```mermaid
+flowchart LR
+  A[ARKit camera + pose] --> B[Person mask<br/>Vision + YOLO11]
+  B --> C[Mask stabiliser]
+  A --> D[Still plate<br/>4096x2048 world-anchored memory]
+  C -->|only mask = 0 pixels| D
+  D --> E{Seen before?}
+  E -->|yes| F[Metal compositor<br/>feathered edge]
+  E -->|no| G[MI-GAN fill<br/>Core ML]
+  G --> D
+  C --> F
+  F --> H[Live display<br/>processed / split / mask]
+```
 
-## The spectacles (the product)
+Everything runs on the phone: Core ML for models, Metal for compositing, ARKit for pose and depth. Full write-ups are in [`docs/`](docs).
 
-Glasses are the right form because the effect follows your gaze and frees your hands. We designed the frame and a light-blocking shield in parametric CAD (FreeCAD and Blender, from one spec). The frame is wayfarer-style with two front camera apertures and a magnetic light-blocking shield. **It is a concept: the camera module, display and optics are not yet selected or modelled, and nothing here is manufacturing-ready.**
+## From a red mask to a room that fills itself
 
-![Assembly](hardware/renders/assembly_3q.jpg)
-![Exploded](hardware/renders/exploded.jpg)
+Each step is a real screenshot from the iPhone app: find the people, fill the gap, autofill never-seen areas, then new places (a bus).
 
-Blueprints: [`hardware/blueprints/`](hardware/blueprints) · spec: [`hardware/specifications/`](hardware/specifications)
+<img src="docs/media/iterations.jpg" alt="Iteration screenshots from the app, stage by stage">
 
-## Proof-of-concept test rig (iPhone app)
+On our **synthetic benchmark** (7 clips, mean score, lower is better) the engine went from **31.6 to 24.8**, about 21% better. It is a synthetic proxy, not real-world accuracy.
 
-The app exists to prove the hard part, the real-time removal, on hardware we already own.
+## The glasses
 
-### Prototype status (measured, not claimed)
+Designed in CAD (FreeCAD) and rendered in Blender. Rev B proved the parts fit; Rev D was rebuilt from a reference sheet into a wayfarer silhouette (0.999 outline overlap); v3 added a rounded foam-seated shield, magnet temples and camera housings.
 
-Measured on iPhone 15 (A16), iOS 26.6.1:
+<table>
+  <tr>
+    <td><img src="docs/media/assembly_3q.jpg" alt="Assembly, three-quarter view"></td>
+    <td><img src="docs/media/exploded.jpg" alt="Exploded view"></td>
+    <td><img src="docs/media/shield_3q.jpg" alt="Magnetic shield"></td>
+  </tr>
+  <tr>
+    <td align="center">Assembly</td>
+    <td align="center">Exploded</td>
+    <td align="center">Magnetic shield</td>
+  </tr>
+</table>
 
-| Metric | Result |
-| --- | --- |
-| Live pipeline, first version (device recordings) | 29-30 FPS, segmentation 12-24 ms, capture-to-display latency 39-67 ms |
-| Depth Anything V2 Small, Neural Engine | 28.2 ms median |
-| LaMa 512 | 499 ms on GPU, hangs on the Neural Engine, so not used live |
-| Still-camera test bench (synthetic clips, 360 frames) | Keyframes engine: person leak 0.39% vs 2.72% for the memory engine on random motion |
+Specifications and assumptions live in [`hardware/specifications`](hardware/specifications). Dimensions from the reference image are provisional, and no camera, display, battery or magnet part is selected yet.
 
-Newer work (still-camera plate, MI-GAN fill, keyframe engine) is **compile-checked and bench-tested offline but not yet re-run on the phone.** Details and the full log: [`docs/`](docs).
+## Privacy
 
-## Run the test rig
+Frames never leave the device. Nothing is recorded or uploaded, there is no account, and no one is identified. The app also reminds you: *people you can't see are still there, so don't walk while using it.*
 
-Needs a Mac with Xcode 26, an iPhone with Developer Mode, and a free Apple ID for signing.
+## Honest status
+
+FOCUS is an **early prototype / concept**.
+
+- The app runs live on an iPhone. The glasses hardware is a CAD design and renders, not a built device.
+- Fills still show ghosting in places, as the screenshots above do.
+- Latency and weight of the glasses are **not measured**, so we quote no numbers for them.
+- The benchmark above is synthetic.
+
+## Run the app
+
+Requirements: Xcode, an ARKit-capable iPhone on iOS 17+, [XcodeGen](https://github.com/yonaskolb/XcodeGen).
 
 ```bash
 brew install xcodegen
-xcodegen generate          # builds Focus.xcodeproj from project.yml
-open Focus.xcodeproj       # pick your team, run on a device (the camera is not available in the simulator)
+xcodegen            # generates Focus.xcodeproj from project.yml
+open Focus.xcodeproj
 ```
 
-Core ML models are not committed (size and licensing). Place `MIGAN512.mlpackage` and `Yolo11sSeg.mlpackage` in `Sources/Models/`; the conversion recipe for MI-GAN is in [`docs/07-still-plan.md`](docs/07-still-plan.md). Note YOLO11 weights are AGPL-3.0, so check the license before redistributing.
+Set your own development team in Xcode, then run on a device. The Core ML models (`LaMa512`, `MIGAN512`) are kept out of git; see `ModelsStash/` and the notes in [`docs/07-still-plan.md`](docs/07-still-plan.md) for how they were converted.
 
-## Honest limits
+## Repository map
 
-- A person who never moves from the first frame is not revealed on a steady camera; the fill is generated and flagged.
-- Moving the phone sideways breaks the rotation-only assumption; the keyframe engine mitigates it for mostly flat surroundings.
-- A TV or monitor playing video is frozen to its remembered image.
-- Sustained thermal behaviour over 5 minutes is not yet measured.
-- The glasses are a concept; the display, optics and on-glasses compute are future work.
+| Path | What is inside |
+|---|---|
+| [`Sources/`](Sources) | The iOS app: renderer, Metal shaders, still plate, MI-GAN fill, Isolate, Try-On |
+| [`Tests/`](Tests) | Unit tests for desk detection, isolation and try-on |
+| [`Bench/`](Bench), [`tools/`](tools) | Offline benchmark and synthetic-clip tooling |
+| [`docs/`](docs) | Feasibility, architecture, plans, benchmark logs |
+| [`hardware/`](hardware) | CAD, Blender scenes, renders, specifications, storyline and launch film sources |
 
-## Docs
+## Team
 
-[01 Feasibility](docs/01-feasibility.md) · [02 Architecture](docs/02-architecture.md) · [03 Plan](docs/03-plan.md) · [04 v2 plan](docs/04-v2-plan.md) · [05 Benchmark](docs/05-p0-benchmark.md) · [06 v3 plan](docs/06-v3-plan.md) · [07 Still-camera layer](docs/07-still-plan.md)
+Built for a hackathon by **Mayank** and **tohraan**.

@@ -11,7 +11,7 @@ enum YoloDecode {
     struct VisionMask { var data: [UInt8]; var w: Int; var h: Int }
 
     static func decode(det: MLMultiArray, protos: MLMultiArray, inW: Float, inH: Float, vision: VisionMask? = nil,
-                       scoreThr: Float = 0.2, nmsIoU: Float = 0.5, maxDet: Int = 40) -> Result {
+                       scoreThr: Float = 0.2, smallThr: Float = 0.12, nmsIoU: Float = 0.5, maxDet: Int = 40) -> Result {
         let C = det.shape[1].intValue, N = det.shape[2].intValue
         let ds = det.strides.map { $0.intValue }
         let PC = protos.shape[1].intValue, PH = protos.shape[2].intValue, PW = protos.shape[3].intValue
@@ -23,7 +23,8 @@ enum YoloDecode {
         var cand: [(score: Float, i: Int)] = []
         for i in 0..<N {
             let s = detRead(ds[1] * 4 + ds[2] * i)
-            if s > scoreThr { cand.append((s, i)) }
+            // far people are small boxes: accept a lower score for them (box height < 15% of the input)
+            if s > scoreThr || (s > smallThr && detRead(ds[1] * 3 + ds[2] * i) < 0.15 * inH) { cand.append((s, i)) }
         }
         cand.sort { $0.score > $1.score }
         // 2. NMS
@@ -69,10 +70,38 @@ enum YoloDecode {
                     }
                 }
             }
+            let small = (k.b.3 - k.b.1) < 0.15 * inH
             let missed = vision == nil || Float(covered) < 0.35 * Float(max(pts.count, 1))
-            for i in pts { mask[i * 2 + 1] = 255; if missed { mask[i * 2] = 255 } }
+            for i in pts {
+                // small (far) people: grow by one prototype pixel (4 image px) so the thin matte never leaves an outline
+                let px = i % PW, py = i / PW
+                for dy in (small ? -1 : 0)...(small ? 1 : 0) {
+                    for dx in (small ? -1 : 0)...(small ? 1 : 0) {
+                        let nx = px + dx, ny = py + dy
+                        if nx < 0 || ny < 0 || nx >= PW || ny >= PH { continue }
+                        let j = ny * PW + nx
+                        mask[j * 2 + 1] = 255; if missed { mask[j * 2] = 255 }
+                    }
+                }
+            }
         }
         return Result(mask: mask, w: PW, h: PH, count: kept.count, scores: kept.map { $0.score })
+    }
+
+    /// Pastes a tile result (covering the normalised rect ox,oy,tw,th of the frame, top-left origin) into a full-frame result (max).
+    static func merge(_ full: inout Result, tile: Result, ox: Float, oy: Float, tw: Float, th: Float) {
+        full.count += tile.count
+        for ty in 0..<tile.h {
+            for tx in 0..<tile.w {
+                let a = tile.mask[(ty * tile.w + tx) * 2], b = tile.mask[(ty * tile.w + tx) * 2 + 1]
+                if a == 0 && b == 0 { continue }
+                let fx = Int((ox + (Float(tx) + 0.5) / Float(tile.w) * tw) * Float(full.w))
+                let fy = Int((oy + (Float(ty) + 0.5) / Float(tile.h) * th) * Float(full.h))
+                if fx < 0 || fy < 0 || fx >= full.w || fy >= full.h { continue }
+                let j = (fy * full.w + fx) * 2
+                full.mask[j] = max(full.mask[j], a); full.mask[j + 1] = max(full.mask[j + 1], b)
+            }
+        }
     }
 
     private static func reader(_ a: MLMultiArray) -> (Int) -> Float {

@@ -8,7 +8,7 @@ struct FocusApp: App {
                 BenchView(model: CommandLine.arguments[i + 1], units: CommandLine.arguments[i + 2])
             }
             else if CommandLine.arguments.contains("-videos") { VideoBatchView() }
-            else { ContentView().preferredColorScheme(.dark) }
+            else { RootView() }
         }
     }
 }

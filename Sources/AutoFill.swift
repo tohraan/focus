@@ -11,10 +11,12 @@ final class AutoFill {
     private let holeTex: MTLTexture, genTex: MTLTexture
     private let q = DispatchQueue(label: "focus.autofill", qos: .utility)
     private var model: MLModel?
-    private var busy = false
-    private var lastRun = 0.0
+    private let busyBox = Guarded(false), lastRunBox = Guarded(0.0)       // touched by the render thread and the fill queue
+    private var busy: Bool { get { busyBox.value } set { busyBox.value = newValue } }
+    private var lastRun: Double { get { lastRunBox.value } set { lastRunBox.value = newValue } }
     var minInterval = 1.0
     var enabled = true
+    func resetTiming() { lastRun = -1e9; busy = false }      // new clip in the offline bench
     var offlineClock: Double?      // video-file tests: run inline, on video time, so results are deterministic
     var modelReady: Bool { model != nil }
     var onStatus: ((String) -> Void)?

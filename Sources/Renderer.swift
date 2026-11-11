@@ -1,6 +1,10 @@
+#if os(iOS)
 import ARKit
+#endif
 import MetalKit
-import SwiftUI
+import Combine
+import ImageIO
+import UniformTypeIdentifiers
 import AVFoundation
 
 struct RenderUniforms {
@@ -33,9 +37,10 @@ private struct FrameData {
     var displayInverse: simd_float3x3
     var timestamp: TimeInterval
     var trackingNormal: Bool
+    var trackingUsable: Bool        // good enough for the still-camera check: normal, or still starting up (rotation from the gyro is valid)
 }
 
-final class Renderer: NSObject, ObservableObject, ARSessionDelegate, MTKViewDelegate {
+final class Renderer: NSObject, ObservableObject, MTKViewDelegate {
     // HUD state (main thread)
     @Published var fps = 0.0
     @Published var segMs = 0.0
@@ -67,21 +72,45 @@ final class Renderer: NSObject, ObservableObject, ARSessionDelegate, MTKViewDele
     private var kf: KeyframeFill?
     private let compositeKFPSO: MTLRenderPipelineState
     private var kfResetFlag = false
+    private var panoResetFlag = false
+    private var prevNormal = false
     private var plate: StillPlate?
     private var migan: MiganFill?
+    private var stab: MaskStabilizer?
+    private var lastStabT = 0.0
+    private var lastStabPose: simd_float4x4?
+    var stabilizeMasks = true
+    var miganLast = ""
+    var plateLog = false
     // still-camera detector: moved > 5 mm or 0.3 deg over the last second => moving; drift > 3 cm or 2 deg from the anchor => moving
     private var poseHist: [(t: Double, pose: simd_float4x4)] = []
     private var stillAnchor: simd_float4x4?
     private var stillSince = 0.0
     private var stillActive = false
     private var lastNormalT = 0.0
+    private var lastUsableT = 0.0
+    private var panoResetFlagForPlate = false
+    private var misalignStreak = 0
+    private var plateLearnFlag = false
     private var captureStart: Double?
     private var captureDoneAt: Double?
+    // diagnostics (stills + text log in Documents; no video)
+    private var logHandle: FileHandle?
+    private var lastLogT = 0.0
+    private var lastCamState = 0
+    private var snapPending: String?
+    private var snapCount = 0
+    private var snapAt6Done = false
+    var autoSnap = false
+    private var lastAutoSnap = 0.0
+    private var rawDumpPSO: MTLComputePipelineState?
     private var emptyYolo: MTLTexture
     private let fillTex: MTLTexture
     private let fillPSO: MTLComputePipelineState
     private var texCache: CVMetalTextureCache!
+#if os(iOS)
     private let session = ARSession()
+#endif
     private let segmenter = PersonSegmenter()
     private let segQueue = DispatchQueue(label: "focus.seg", qos: .userInteractive)
     private let lock = NSLock()
@@ -122,10 +151,22 @@ final class Renderer: NSObject, ObservableObject, ARSessionDelegate, MTKViewDele
         kf = KeyframeFill(device: device, library: lib)
         plate = StillPlate(device: device, library: lib)
         migan = MiganFill(device: device, queue: queue, library: lib)
-        migan?.onStatus = { [weak self] t in DispatchQueue.main.async { self?.autoStatus = t } }
+#if os(iOS)
+        migan?.minInterval = 1.2
+#endif
+        stab = MaskStabilizer(device: device, library: lib)
+        rawDumpPSO = lib.makeFunction(name: "rawDump").flatMap { try? device.makeComputePipelineState(function: $0) }
+        let env = ProcessInfo.processInfo.environment            // bench ablations
+        if env["FOCUS_NOMIGAN"] != nil { migan?.enabled = false }
+        if env["FOCUS_NOSTAB"] != nil { stabilizeMasks = false }
+        if env["FOCUS_PLATELOG"] != nil { plateLog = true }
+        if env["FOCUS_NOPLATE"] != nil { plate = nil }
+        migan?.onStatus = { [weak self] t in self?.miganLast = t; DispatchQueue.main.async { self?.autoStatus = t } }
         autoFill = AutoFill(device: device, queue: queue, library: lib)
+        if ProcessInfo.processInfo.environment["FOCUS_NOMIGAN"] != nil { autoFill?.enabled = false }
         autoFill?.onStatus = { [weak self] t in DispatchQueue.main.async { self?.autoStatus = t } }
         setupCSV()
+        setupStillLog()
     }
 
     private static func makeYolo(_ device: MTLDevice, _ bytes: [UInt8], _ w: Int, _ h: Int) -> MTLTexture {
@@ -147,6 +188,7 @@ final class Renderer: NSObject, ObservableObject, ARSessionDelegate, MTKViewDele
     func resetMemory() {
         kf?.reset()
         plate?.reset()
+        stab?.reset(); lastStabPose = nil
         poseHist.removeAll(); stillAnchor = nil; stillActive = false; lastNormalT = 0
         lock.lock(); defer { lock.unlock() }
         pano = Renderer.makePano(device)   // zero-filled => alpha 0 = unknown
@@ -167,30 +209,37 @@ final class Renderer: NSObject, ObservableObject, ARSessionDelegate, MTKViewDele
     private func updateCaptureUI() {
         let now = ProcessInfo.processInfo.systemUptime
         let cov = Double(plate?.coverage ?? 0)
-        let still = stillActive
+        let still = stillActive                              // the plate is in use
+        let camSteady = lastCamState == 2
         var title: String? = nil, detail = "", prog = 0.0
         if let t0 = captureStart {
             let el = now - t0
-            if still {
-                prog = cov
-                if cov >= 0.9 || captureDoneAt != nil {
-                    if captureDoneAt == nil { captureDoneAt = now }
-                    title = "Background captured"; detail = String(format: "%.0f%% of the scene learned. You can move freely now.", cov * 100); prog = 1
-                } else {
-                    title = "Capturing background"
-                    detail = String(format: "Camera is still. %.0f%% of the scene learned. Keep moving around; spots you stand on are filled once you step away.", cov * 100)
-                }
+            prog = cov
+            if cov >= 0.9 || captureDoneAt != nil {
+                if captureDoneAt == nil { captureDoneAt = now }
+                title = "Background captured"; detail = String(format: "%.0f%% of the view is learned. Keep the phone steady, or pan slowly.", cov * 100); prog = 1
             } else {
-                prog = min(1, Double(kf?.count ?? 0) / 6.0)
                 title = "Capturing background"
-                detail = "Camera is moving. Pan slowly across the room (views saved: \(kf?.count ?? 0)). Prop the phone still to learn the background faster."
-                if (kf?.count ?? 0) >= 6 && captureDoneAt == nil { captureDoneAt = now }
-                if captureDoneAt != nil { title = "Background captured"; detail = "\(kf?.count ?? 0) views saved."; prog = 1 }
+                detail = String(format: "%@ %.0f%% of what you see is learned. Step out of the way, move around, and pan slowly; spots you stand on fill in once you step away.",
+                                camSteady ? "Camera is steady." : "Camera is moving.", cov * 100)
             }
             if let d = captureDoneAt, now - d > 2.5 { captureStart = nil; captureDoneAt = nil; title = nil }
             else if el > 30 { captureStart = nil; title = nil }
         }
-        let st = still ? String(format: "camera: still · background %.0f%%", cov * 100) : "camera: moving"
+        if now - lastLogT > 0.5 {
+            lastLogT = now
+            let g = plate?.gain ?? SIMD3<Float>(1, 1, 1)
+            let line = String(format: "%.1f | %@ | %d | %d | %.2f | %.2f,%.2f,%.2f | %d %@ | mis=%.2f | %.0f\n", now, tracking, lastCamState, still ? 1 : 0, cov, g.x, g.y, g.z, plate?.resetCount ?? 0, plate?.lastResetReason ?? "", plate?.misalignFrac ?? 0, fps)
+            logHandle?.write(Data(line.utf8))
+        }
+        if captureStart == nil { snapAt6Done = false }
+        else if let t0 = captureStart {
+            if now - t0 > 6 && !snapAt6Done { snapAt6Done = true; snapPending = "capture6s" }
+            if captureDoneAt != nil && snapPending == nil && now - (captureDoneAt ?? now) < 0.2 { snapPending = "captured" }
+        }
+        let cam = lastCamState == 2 ? "still" : (lastCamState == 1 ? "steady" : "moving")
+        let st = still ? String(format: "camera: %@ · background %.0f%%", cam, cov * 100) : "camera: \(cam) · background off"
+        if autoSnap, now - lastAutoSnap > 2.0, snapCount < 90 { lastAutoSnap = now; snapPending = "auto" }
         DispatchQueue.main.async {
             self.stillStatus = st
             self.captureTitle = title; if title != nil { self.captureDetail = detail; self.captureProgress = prog }
@@ -220,6 +269,28 @@ final class Renderer: NSObject, ObservableObject, ARSessionDelegate, MTKViewDele
         return t - stillSince >= 0.5 ? 2 : 1
     }
 
+    private func setupStillLog() {
+        let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("still_log.txt")
+        FileManager.default.createFile(atPath: url.path, contents: Data("t | tracking | camState | stillActive | plateCoverage | gain | resets | fps\n".utf8))
+        logHandle = try? FileHandle(forWritingTo: url)
+        logHandle?.seekToEndOfFile()
+    }
+
+    /// Saves live / plate / confidence / foreground images (plate resolution) for the next frame. Used by the capture button and the controls panel.
+    func requestSnapshot(_ tag: String) { snapPending = tag }
+
+    private func writePNG(_ tex: MTLTexture, to url: URL) {
+        let w = tex.width, h = tex.height
+        var bytes = [UInt8](repeating: 0, count: w * h * 4)
+        tex.getBytes(&bytes, bytesPerRow: w * 4, from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
+        guard let ctx = CGContext(data: &bytes, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue),
+              let img = ctx.makeImage() else { return }
+        if let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) {
+            CGImageDestinationAddImage(dest, img, nil); CGImageDestinationFinalize(dest)
+        }
+    }
+
     private func setupCSV() {
         let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("metrics.csv")
         FileManager.default.createFile(atPath: url.path, contents: Data("t,seg_ms,latency_ms,tracking\n".utf8))
@@ -237,6 +308,7 @@ final class Renderer: NSObject, ObservableObject, ARSessionDelegate, MTKViewDele
         v.delegate = self
     }
 
+#if os(iOS)
     func start() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .denied, .restricted:
@@ -287,7 +359,11 @@ final class Renderer: NSObject, ObservableObject, ARSessionDelegate, MTKViewDele
         case .limited(let r): trackText = "limited (\(r))"
         }
         let normal = cam.trackingState == .normal
+        var usable = normal
+        if case .limited(let why) = cam.trackingState, why == .initializing || why == .insufficientFeatures { usable = true }   // a phone propped on a table never leaves "initializing"
         if case .limited(let why) = cam.trackingState, why == .relocalizing { kfResetFlag = true }   // world frame may have jumped
+        if normal && !prevNormal { kfResetFlag = true; panoResetFlag = true }                          // initialising -> normal re-bases the world frame
+        prevNormal = normal
         let m = cam.transform
         let c2w = simd_float3x3(SIMD3(m.columns.0.x, m.columns.0.y, m.columns.0.z),
                                 SIMD3(m.columns.1.x, m.columns.1.y, m.columns.1.z),
@@ -301,7 +377,7 @@ final class Renderer: NSObject, ObservableObject, ARSessionDelegate, MTKViewDele
             let mo = self.segmenter.segment(pb)
             guard let maskPB = mo.vision,
                   let fd = self.makeFrame(pb: pb, mask: maskPB, yolo: mo.yolo, pose: m, c2w: c2w, K: K, isz: isz,
-                                          disp: disp, ts: ts, normal: normal) else {
+                                          disp: disp, ts: ts, normal: normal, usable: usable) else {
                 self.release(); return
             }
             self.segMsLast = (ProcessInfo.processInfo.systemUptime - t0) * 1000
@@ -313,6 +389,11 @@ final class Renderer: NSObject, ObservableObject, ARSessionDelegate, MTKViewDele
             }
         }
     }
+
+#else
+    func start() {}
+    func stop() {}
+#endif
 
     private func release() { lock.lock(); busy = false; lock.unlock() }
 
@@ -326,7 +407,7 @@ final class Renderer: NSObject, ObservableObject, ARSessionDelegate, MTKViewDele
     }
 
     private func makeFrame(pb: CVPixelBuffer, mask: CVPixelBuffer, yolo: YoloDecode.Result?, pose: simd_float4x4, c2w: simd_float3x3, K: simd_float3x3,
-                           isz: SIMD2<Float>, disp: CGAffineTransform, ts: TimeInterval, normal: Bool) -> FrameData? {
+                           isz: SIMD2<Float>, disp: CGAffineTransform, ts: TimeInterval, normal: Bool, usable: Bool) -> FrameData? {
         guard let (y, ky) = tex(pb, .r8Unorm, plane: 0),
               let (c, kc) = tex(pb, .rg8Unorm, plane: 1),
               let (m, km) = tex(mask, .r8Unorm, plane: -1) else { return nil }
@@ -335,7 +416,7 @@ final class Renderer: NSObject, ObservableObject, ARSessionDelegate, MTKViewDele
                               SIMD3(Float(disp.tx), Float(disp.ty), 1))
         let yt = yolo.map { Renderer.makeYolo(device, $0.mask, $0.w, $0.h) } ?? emptyYolo
         return FrameData(yTex: y, cTex: c, mTex: m, yoloTex: yt, keep: [ky, kc, km], pose: pose, camToWorld: c2w, intrinsics: K,
-                         imageSize: isz, displayInverse: d, timestamp: ts, trackingNormal: normal)
+                         imageSize: isz, displayInverse: d, timestamp: ts, trackingNormal: normal, trackingUsable: usable)
     }
 
     // MARK: MTKViewDelegate
@@ -352,23 +433,89 @@ final class Renderer: NSObject, ObservableObject, ARSessionDelegate, MTKViewDele
         viewSize = view.bounds.size
         let K = fd.intrinsics
         let panoTex = pano
-        encodeScene(fd: fd, cb: cb, rpd: rpd, viewSize: viewSize)
+        let fdS = encodeScene(fd: fd, cb: cb, rpd: rpd, viewSize: viewSize)
         cb.present(drawable)
-        finishDraw(fd: fd, cb: cb, panoTex: panoTex, offline: false)
+        finishDraw(fd: fdS, cb: cb, panoTex: panoTex, offline: false)
     }
 
     /// Everything that turns one FrameData into pixels (memory update, fill, keyframes, composite). Shared by live and offline paths.
-    private func encodeScene(fd: FrameData, cb: MTLCommandBuffer, rpd: MTLRenderPassDescriptor, viewSize: CGSize) {
+    @discardableResult
+    private func encodeScene(fd: FrameData, cb: MTLCommandBuffer, rpd: MTLRenderPassDescriptor, viewSize: CGSize) -> FrameData {
+        var fd = fd
         let K = fd.intrinsics
+        if panoResetFlag { lock.lock(); pano = Renderer.makePano(device); lock.unlock(); panoResetFlag = false; panoResetFlagForPlate = true }
         let panoTex = pano
         if kfResetFlag { kf?.reset(); kfResetFlag = false }
-        let camState = updateStill(pose: fd.pose, t: fd.timestamp, normal: fd.trackingNormal)
-        let nowStill = camState > 0
-        if nowStill, let pl = plate {
-            pl.encode(cb: cb, y: fd.yTex, c: fd.cTex, mask: fd.mTex, yolo: fd.yoloTex, imageSize: fd.imageSize, learn: camState == 2)
-        } else if stillActive { plate?.reset() }          // camera moved or tracking lost for good: the plate is no longer valid
-        stillActive = nowStill
-        if engine == 0, fd.trackingNormal, let enc = cb.makeComputeCommandEncoder() {
+        let camState = updateStill(pose: fd.pose, t: fd.timestamp, normal: fd.trackingUsable)   // 0 moving/lost, 1 frozen, 2 still: only used for the status line and mask release now
+        // camera speed (from the pose) decides whether the plate may learn and how fast the mask fades
+        var rotSpeed = 0.0, transSpeed = 0.0
+        if let lp = lastStabPose, fd.timestamp > lastStabT {
+            let dt = fd.timestamp - lastStabT
+            let dist = simd_distance(SIMD3(lp.columns.3.x, lp.columns.3.y, lp.columns.3.z), SIMD3(fd.pose.columns.3.x, fd.pose.columns.3.y, fd.pose.columns.3.z))
+            rotSpeed = Double(Reproject.angleDeg(lp, fd.pose)) / dt; transSpeed = Double(dist) / dt
+        }
+        let fast = camState == 0 || rotSpeed > 10 || transSpeed > 0.1
+        let rawMaskTex = fd.mTex, rawYoloTex = fd.yoloTex
+        if stabilizeMasks, let st = stab {                // flicker fix: every later step sees the temporally smoothed masks
+            let dt = lastStabPose == nil ? 1.0 / 30 : max(fd.timestamp - lastStabT, 1.0 / 120)
+            st.encode(cb: cb, rawMask: fd.mTex, rawYolo: fd.yoloTex, imageSize: fd.imageSize, dt: dt, moving: fast)
+            if let m = st.mask, let y = st.yolo { fd.mTex = m; fd.yoloTex = y }
+        }
+        lastStabT = fd.timestamp; lastStabPose = fd.pose
+        lastCamState = camState
+
+        // World-anchored plate (rotation only): usable whenever the pose is. It learns unless the camera is moving fast or translating.
+        if fd.trackingUsable { lastUsableT = fd.timestamp }
+        let lostLong = !fd.trackingUsable && fd.timestamp - lastUsableT > 2.0
+        var plateOn = fd.trackingUsable
+        let pos = SIMD3<Float>(fd.pose.columns.3.x, fd.pose.columns.3.y, fd.pose.columns.3.z)
+        var plateLearning = false
+        if let pl = plate {
+            if lostLong { pl.reset("tracking lost") }
+            if panoResetFlagForPlate { pl.reset("world re-based") }
+            panoResetFlagForPlate = false
+            if plateOn, pl.anchored, simd_distance(pos, pl.refPos) > 0.8 { pl.reset("walked far from start") }          // rotation-only map: parallax grows with distance
+            if plateOn {
+                // misaligned plate (translation parallax, bad pose): stop using it at once instead of replacing the picture with a wrong one; wipe only if it stays bad
+                let mis = pl.misalignFrac > 0.25 && ProcessInfo.processInfo.environment["FOCUS_NOGUARD"] == nil
+                if mis { misalignStreak += 1 } else if pl.misalignFrac < 0.10 { misalignStreak = 0 }
+                if misalignStreak > 45 { pl.reset("misaligned 1.5 s"); misalignStreak = 0 }
+                plateLearning = !mis && rotSpeed < 45 && transSpeed < 0.15
+                pl.encode(cb: cb, y: fd.yTex, c: fd.cTex, mask: fd.mTex, yolo: fd.yoloTex, imageSize: fd.imageSize, learn: plateLearning,
+                          camRot: fd.camToWorld, camPos: pos, K: K)
+                if plateLog, Int(fd.timestamp * 30) % 15 == 0 { print(String(format: "t=%.2f camState=%d cov=%.2f resets=%d(%@) mis=%.2f gain=%.3f rot=%.1f", fd.timestamp, camState, pl.coverage, pl.resetCount, pl.lastResetReason, pl.misalignFrac, pl.gain.x, rotSpeed)) }
+                if mis { plateOn = false }           // this frame the engines' own fill is shown instead
+            }
+        } else { plateOn = false }
+        plateLearnFlag = plateLearning
+        if let tag = snapPending, let rpso = rawDumpPSO {
+            snapPending = nil; snapCount += 1
+            let n = snapCount
+            func shared(_ w: Int, _ h: Int) -> MTLTexture {
+                let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: w, height: h, mipmapped: false)
+                td.usage = [.shaderWrite, .shaderRead]; td.storageMode = .shared
+                return device.makeTexture(descriptor: td)!
+            }
+            var outs: [(String, MTLTexture)] = []
+            let a = shared(640, 480), b = shared(640, 480)
+            if let e = cb.makeComputeCommandEncoder() {
+                e.setComputePipelineState(rpso)
+                e.setTexture(fd.yTex, index: 0); e.setTexture(fd.cTex, index: 1); e.setTexture(rawMaskTex, index: 2); e.setTexture(rawYoloTex, index: 3)
+                e.setTexture(a, index: 4); e.setTexture(b, index: 5)
+                e.dispatchThreads(MTLSize(width: 640, height: 480, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+                e.endEncoding()
+                outs += [("rawlive", a), ("rawmask", b)]
+            }
+            if plateOn, let pl = plate, let d = pl.encodeDump(cb: cb, y: fd.yTex, c: fd.cTex) { outs += Array(zip(["live", "plate", "conf", "fg"], d)) }
+            cb.addCompletedHandler { [weak self] _ in
+                guard let self else { return }
+                let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("snap")
+                try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                for (name, t) in outs { self.writePNG(t, to: dir.appendingPathComponent(String(format: "%03d_%@_%@.png", n, tag, name))) }
+            }
+        }
+        stillActive = plateOn
+        if engine == 0, fd.trackingUsable, let enc = cb.makeComputeCommandEncoder() {
             var pu = PanoUniforms(camToWorld: fd.camToWorld, fx: K[0][0], fy: K[1][1], cx: K[2][0], cy: K[2][1],
                                   imageSize: fd.imageSize, maskRadius: 4.0 / fd.imageSize.x, blend: 0.15)
             enc.setComputePipelineState(updatePSO)
@@ -381,7 +528,7 @@ final class Renderer: NSObject, ObservableObject, ARSessionDelegate, MTKViewDele
             enc.endEncoding()
         }
 
-        if engine == 0, fd.trackingNormal, let enc = cb.makeComputeCommandEncoder() {
+        if engine == 0, fd.trackingUsable, let enc = cb.makeComputeCommandEncoder() {
             memset(statsBuf.contents(), 0, 32)
             var pu = PanoUniforms(camToWorld: fd.camToWorld, fx: K[0][0], fy: K[1][1], cx: K[2][0], cy: K[2][1], imageSize: fd.imageSize)
             enc.setComputePipelineState(gainPSO)
@@ -404,7 +551,7 @@ final class Renderer: NSObject, ObservableObject, ARSessionDelegate, MTKViewDele
         var kfU = KFUniforms()
         if engine == 1, let kf = kf {
             kf.encode(cb: cb, y: fd.yTex, c: fd.cTex, mask: fd.mTex, yolo: fd.yoloTex, camToWorld: fd.pose, K: K,
-                      imageSize: fd.imageSize, tracking: fd.trackingNormal, time: fd.timestamp, still: stillActive)
+                      imageSize: fd.imageSize, tracking: fd.trackingUsable, time: fd.timestamp, still: stillActive)
             kfU = kf.uniforms
         }
         var ru = RenderUniforms(viewToImage: fd.displayInverse, camToWorld: fd.camToWorld,
@@ -414,6 +561,7 @@ final class Renderer: NSObject, ObservableObject, ARSessionDelegate, MTKViewDele
                                 still: stillActive && plate != nil ? 1 : 0)
         let stD = stillActive ? plate?.disp : nil, stO = stillActive ? plate?.off : nil, stF = stillActive ? plate?.fg : nil
         let dummyTex = plate?.dummy ?? emptyYolo
+        var canvasU = stillActive ? (plate?.lastCanvas ?? CanvasUniforms.identity) : CanvasUniforms.identity
         let enc = cb.makeRenderCommandEncoder(descriptor: rpd)!
         enc.setFragmentTexture(stD ?? dummyTex, index: 8); enc.setFragmentTexture(stO ?? dummyTex, index: 9); enc.setFragmentTexture(stF ?? dummyTex, index: 10)
         if engine == 1, let kf = kf {
@@ -425,15 +573,18 @@ final class Renderer: NSObject, ObservableObject, ARSessionDelegate, MTKViewDele
             enc.setFragmentTexture(panoTex, index: 11)
             enc.setFragmentBytes(&ru, length: MemoryLayout<RenderUniforms>.stride, index: 0)
             enc.setFragmentBytes(&kfU, length: MemoryLayout<KFUniforms>.stride, index: 1)
+            enc.setFragmentBytes(&canvasU, length: MemoryLayout<CanvasUniforms>.stride, index: 2)
         } else {
             enc.setRenderPipelineState(compositePSO)
             enc.setFragmentTexture(fd.yTex, index: 0); enc.setFragmentTexture(fd.cTex, index: 1)
             enc.setFragmentTexture(fd.mTex, index: 2); enc.setFragmentTexture(panoTex, index: 3)
             enc.setFragmentTexture(fd.yoloTex, index: 4); enc.setFragmentTexture(fillTex, index: 5)
             enc.setFragmentBytes(&ru, length: MemoryLayout<RenderUniforms>.stride, index: 0)
+            enc.setFragmentBytes(&canvasU, length: MemoryLayout<CanvasUniforms>.stride, index: 2)
         }
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         enc.endEncoding()
+        return fd
     }
 
     private func finishDraw(fd: FrameData, cb: MTLCommandBuffer, panoTex: MTLTexture, offline: Bool) {
@@ -441,7 +592,7 @@ final class Renderer: NSObject, ObservableObject, ARSessionDelegate, MTKViewDele
         let keep = fd.keep
         let (yT, cT, mT, oT) = (fd.yTex, fd.cTex, fd.mTex, fd.yoloTex)
         let keepObjs: [AnyObject] = keep.map { $0 as AnyObject }
-        let c2w = fd.camToWorld, isz = fd.imageSize, fdTracking = fd.trackingNormal
+        let c2w = fd.camToWorld, isz = fd.imageSize, fdTracking = fd.trackingUsable
         let ts = fd.timestamp
         let track = fd.trackingNormal ? "normal" : "limited"
         cb.addCompletedHandler { [weak self] _ in
@@ -457,7 +608,7 @@ final class Renderer: NSObject, ObservableObject, ARSessionDelegate, MTKViewDele
             }
             self.kf?.finishSweep()
             if self.engine == 1, self.frameCount % 10 == 0, let k = self.kf { let t = k.status; DispatchQueue.main.async { self.autoStatus = t } }
-            if !offline, self.stillActive, let pl = self.plate, let mg = self.migan {
+            if !offline, self.stillActive, self.plateLearnFlag, let pl = self.plate, let mg = self.migan {
                 mg.request(MiganFill.Frame(y: yT, c: cT, keep: keepObjs), plate: pl)
             }
             if !offline, !self.stillActive, fdTracking, let af = self.autoFill {
@@ -494,15 +645,15 @@ final class Renderer: NSObject, ObservableObject, ARSessionDelegate, MTKViewDele
         let mo = segmenter.segment(pb)
         guard let maskPB = mo.vision,
               let fd = makeFrame(pb: pb, mask: maskPB, yolo: mo.yolo, pose: m, c2w: c2w, K: K, isz: isz,
-                                 disp: .identity, ts: ts, normal: true),
+                                 disp: .identity, ts: ts, normal: true, usable: true),
               let cb = queue.makeCommandBuffer() else { return false }
         let rpd = MTLRenderPassDescriptor()
         rpd.colorAttachments[0].texture = target
         rpd.colorAttachments[0].loadAction = .dontCare
         rpd.colorAttachments[0].storeAction = .store
         let saved = self.mode; self.mode = mode; defer { self.mode = saved }
-        encodeScene(fd: fd, cb: cb, rpd: rpd, viewSize: CGSize(width: Double(isz.x), height: Double(isz.y)))
-        finishDraw(fd: fd, cb: cb, panoTex: pano, offline: true)
+        let fdS = encodeScene(fd: fd, cb: cb, rpd: rpd, viewSize: CGSize(width: Double(isz.x), height: Double(isz.y)))
+        finishDraw(fd: fdS, cb: cb, panoTex: pano, offline: true)
         cb.waitUntilCompleted()
         if stillActive, let pl = plate, let mg = migan {
             mg.offlineClock = ts
@@ -523,6 +674,7 @@ final class Renderer: NSObject, ObservableObject, ARSessionDelegate, MTKViewDele
         segmenter.yolo?.syncMode = true
         for _ in 0..<200 where !((autoFill?.modelReady ?? true) && (migan?.modelReady ?? true)) { Thread.sleep(forTimeInterval: 0.1) }   // LaMa preloads asynchronously
         resetMemory(); gain = SIMD4<Float>(1, 1, 1, 1)
+        migan?.resetTiming(); autoFill?.resetTiming(); lastStabPose = nil; lastUsableT = 0
     }
 
     func makeTarget(width: Int, height: Int) -> MTLTexture {
@@ -532,3 +684,7 @@ final class Renderer: NSObject, ObservableObject, ARSessionDelegate, MTKViewDele
     }
     var kfStatus: String { kf?.status ?? "" }
 }
+
+#if os(iOS)
+extension Renderer: ARSessionDelegate {}
+#endif

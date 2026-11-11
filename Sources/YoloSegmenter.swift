@@ -16,6 +16,37 @@ final class YoloSegmenter {
         request.imageCropAndScaleOption = .scaleFill   // full 4:3 sensor frame -> 1280x960, no letterbox
     }
 
+    /// Overlapping 60% tiles (top-left origin): each is scaled up 1.67x so far-away people are big enough to detect.
+    static let tiles: [(x: Float, y: Float)] = [(0, 0), (0.4, 0), (0, 0.4), (0.4, 0.4)]
+    static let tileSize: Float = 0.6
+    private var tileMask: [YoloDecode.Result?] = [nil, nil, nil, nil]
+    private var tileCursor = 0
+
+    /// Runs the request on one tile; returns its decoded result, or nil.
+    private func runTile(_ k: Int, _ pb: CVPixelBuffer, vision: YoloDecode.VisionMask?) -> YoloDecode.Result? {
+        let t = Self.tiles[k], sz = Self.tileSize
+        request.regionOfInterest = CGRect(x: CGFloat(t.x), y: CGFloat(1 - t.y - sz), width: CGFloat(sz), height: CGFloat(sz))  // Vision: origin bottom-left
+        defer { request.regionOfInterest = CGRect(x: 0, y: 0, width: 1, height: 1) }
+        try? handler.perform([request], on: pb, orientation: .up)
+        var v: YoloDecode.VisionMask?
+        if let vm = vision {   // crop the Vision matte to the tile so "already covered" is judged in tile coordinates
+            let x0 = Int(t.x * Float(vm.w)), y0 = Int(t.y * Float(vm.h)), cw = Int(sz * Float(vm.w)), ch = Int(sz * Float(vm.h))
+            var d = [UInt8](repeating: 0, count: cw * ch)
+            for y in 0..<ch { for x in 0..<cw { d[y * cw + x] = vm.data[min(vm.h - 1, y0 + y) * vm.w + min(vm.w - 1, x0 + x)] } }
+            v = YoloDecode.VisionMask(data: d, w: cw, h: ch)
+        }
+        return result(vision: v)
+    }
+
+    /// Full-frame result plus the stored tile results (max).
+    private func combined(_ full: YoloDecode.Result?) -> YoloDecode.Result? {
+        guard var r = full else { return nil }
+        for (k, tr) in tileMask.enumerated() {
+            if let tr = tr { YoloDecode.merge(&r, tile: tr, ox: Self.tiles[k].x, oy: Self.tiles[k].y, tw: Self.tileSize, th: Self.tileSize) }
+        }
+        return r
+    }
+
     private let handler = VNSequenceRequestHandler()
     private let queue = DispatchQueue(label: "focus.yolo", qos: .userInitiated)
     private let lock = NSLock()
@@ -31,7 +62,10 @@ final class YoloSegmenter {
             let t = ProcessInfo.processInfo.systemUptime
             try? handler.perform([request], on: pb, orientation: .up)
             lastMs = (ProcessInfo.processInfo.systemUptime - t) * 1000
-            return result(vision: vision)
+            let full = result(vision: vision)
+            for k in 0..<4 { tileMask[k] = runTile(k, pb, vision: vision) }
+            lastMs = (ProcessInfo.processInfo.systemUptime - t) * 1000
+            return combined(full)
         }
         lock.lock()
         let start = !busy
@@ -42,7 +76,11 @@ final class YoloSegmenter {
             queue.async { [self] in
                 let t = ProcessInfo.processInfo.systemUptime
                 try? handler.perform([request], on: pb, orientation: .up)
-                let res = result(vision: vision)
+                let full = result(vision: vision)
+                // one tile per cycle, round robin: every tile refreshes about every 4 cycles
+                let k = tileCursor; tileCursor = (tileCursor + 1) % 4
+                tileMask[k] = runTile(k, pb, vision: vision)
+                let res = combined(full)
                 lock.lock(); latest = res; busy = false; lastMs = (ProcessInfo.processInfo.systemUptime - t) * 1000; lock.unlock()
             }
         }
